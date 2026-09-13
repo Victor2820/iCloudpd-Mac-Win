@@ -1,0 +1,153 @@
+# Builds single-file macOS executables (Apple Silicon + Intel) for the customized icloudpd.
+#
+# Same design as build-win-exe.yml: this repository does NOT carry the upstream
+# source. It only carries the files that differ from upstream (see custom/). The
+# job fetches upstream at a pinned commit, applies those files, and packages the
+# result with PyInstaller.
+#
+# Each architecture is built on a native runner, because PyInstaller cannot
+# cross-compile between arm64 and x86_64 on macOS:
+#   macos-14        -> 3 CPU Apple Silicon (M1)  -> arm64
+#   macos-15-intel  -> 4 CPU Intel               -> x86_64
+#
+# The finished binaries are attached to releases named mac-<asset>-<run number>.
+
+name: Build macOS binaries (arm64 + x86_64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "custom/icloudpd-custom.patch"
+      - "custom/guided_setup.py"
+      - "custom/remember.py"
+      - "custom/build_mac_bin.sh"
+      - ".github/workflows/build-mac-bin.yml"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: icloud-photos-downloader/icloud_photos_downloader
+  UPSTREAM_SHA: 879c561240d993d748ddb4546f935090502b16d3
+  ICLOUDPD_VERSION: "1.32.3"
+  ICLOUDPD_COMMIT_SHA: "879c561"
+  ICLOUDPD_COMMIT_TS: "1780177342"
+
+jobs:
+  build-mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+            asset: icloudpd-mac-arm64
+            label: Apple Silicon (arm64)
+          - runner: macos-15-intel
+            arch: x86_64
+            asset: icloudpd-mac-x86_64
+            label: Intel (x86_64)
+
+    runs-on: ${{ matrix.runner }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream source at the pinned commit
+        run: |
+          curl -sSL -o up.tar.gz \
+            "https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/${UPSTREAM_SHA}"
+          mkdir -p build
+          tar xzf up.tar.gz -C build --strip-components=1
+          ls build | head -20
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Apply the customizations
+        run: |
+          cd build
+          git init -q .
+          # A checkout that converts line endings would stop git apply from
+          # matching the patch context, so normalise the inputs to LF first.
+          tr -d '\r' < ../custom/icloudpd-custom.patch > /tmp/icloudpd-custom.patch
+          git apply -p1 --verbose /tmp/icloudpd-custom.patch
+          tr -d '\r' < ../custom/guided_setup.py > src/icloudpd/guided_setup.py
+          tr -d '\r' < ../custom/remember.py > src/icloudpd/remember.py
+
+      - name: Verify the customizations are byte for byte identical
+        run: |
+          cd build
+          shasum -a 256 src/icloudpd/cli.py src/icloudpd/guided_setup.py src/icloudpd/remember.py
+          echo "f6882ee5124844721b8e06f627b33a6a079eda11aac2e4c7b734559be3169713  src/icloudpd/cli.py" | shasum -a 256 -c -
+          echo "6ad409962da1ab74930044065d41c5bc79935de003310c0d5a305be17a5d5e7b  src/icloudpd/guided_setup.py" | shasum -a 256 -c -
+          echo "79a597990aa62435b782635c2fd268041533d6781108a149b63a38473414f91a  src/icloudpd/remember.py" | shasum -a 256 -c -
+
+      - name: Sanity-check the customizations landed
+        run: |
+          cd build
+          test -f src/icloudpd/guided_setup.py
+          test -f src/icloudpd/remember.py
+          grep -n 'default="original"' src/icloudpd/cli.py
+          grep -n 'no-remember' src/icloudpd/cli.py
+
+      - name: Install dependencies
+        run: |
+          cd build
+          python -m pip install --disable-pip-version-check --upgrade "pip>=25.1"
+          python -m pip install --disable-pip-version-check -r requirements-pip.txt
+          python -m pip install --disable-pip-version-check -e . --group dev
+          python -m PyInstaller --version
+
+      - name: Build the single-file executable
+        env:
+          ICLOUDPD_SRC_ROOT: ${{ github.workspace }}/build
+        run: |
+          bash custom/build_mac_bin.sh "${{ matrix.asset }}" "${{ matrix.arch }}"
+
+      - name: Collect the artifact
+        env:
+          ASSET: ${{ matrix.asset }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cd build/dist
+          file "$ASSET"
+          test "$(lipo -archs "$ASSET")" = "$ARCH"
+          mkdir -p ../out
+          cp "$ASSET" "$ASSET.sha256" ../out/
+          cd ../out
+          cat "$ASSET.sha256"
+          ls -la
+
+      - name: Upload as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          if-no-files-found: error
+          path: build/out/*
+
+      - name: Attach to a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh cannot infer the repository here: build/ is a throwaway git repo
+          # created only so that `git apply` has somewhere to run, and it has no
+          # remote (that surfaces as "no git remotes found").
+          GH_REPO: ${{ github.repository }}
+          ASSET: ${{ matrix.asset }}
+          LABEL: ${{ matrix.label }}
+        run: |
+          cd build/out
+          TAG="mac-${ASSET}-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" \
+            --title "${ASSET} - ${LABEL} - build ${GITHUB_RUN_NUMBER}" \
+            --notes "Automated macOS build for ${LABEL}. Upstream ${UPSTREAM_REPO} at ${UPSTREAM_SHA}. Customizations: guided setup, remembered Apple ID and directory, live photo filename policy default = original, no keyring in the guided password prompt." \
+            "$ASSET" "$ASSET.sha256"
