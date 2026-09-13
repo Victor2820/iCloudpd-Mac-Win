@@ -45,13 +45,30 @@ jobs:
           tar xzf up.tar.gz -C build --strip-components=1
           ls build | head -20
 
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Apply the customizations
         run: |
           cd build
           git init -q .
-          git apply -p1 --verbose ../custom/icloudpd-custom.patch
-          cp ../custom/guided_setup.py src/icloudpd/guided_setup.py
-          cp ../custom/remember.py src/icloudpd/remember.py
+          # A Windows checkout rewrites these files with CRLF endings, which stops
+          # git apply from matching the patch context and would leave stray CRs in
+          # the Python sources. Normalise everything back to LF first.
+          tr -d '\r' < ../custom/icloudpd-custom.patch > /tmp/icloudpd-custom.patch
+          git apply -p1 --verbose /tmp/icloudpd-custom.patch
+          tr -d '\r' < ../custom/guided_setup.py > src/icloudpd/guided_setup.py
+          tr -d '\r' < ../custom/remember.py > src/icloudpd/remember.py
+
+      - name: Verify the customizations are byte for byte identical
+        run: |
+          cd build
+          sha256sum src/icloudpd/cli.py src/icloudpd/guided_setup.py src/icloudpd/remember.py
+          echo "f6882ee5124844721b8e06f627b33a6a079eda11aac2e4c7b734559be3169713  src/icloudpd/cli.py" | sha256sum -c -
+          echo "6ad409962da1ab74930044065d41c5bc79935de003310c0d5a305be17a5d5e7b  src/icloudpd/guided_setup.py" | sha256sum -c -
+          echo "79a597990aa62435b782635c2fd268041533d6781108a149b63a38473414f91a  src/icloudpd/remember.py" | sha256sum -c -
 
       - name: Bake version info
         run: |
@@ -77,11 +94,6 @@ jobs:
           test -f src/icloudpd/remember.py
           grep -n 'default="original"' src/icloudpd/cli.py
           grep -n 'version="1.32.3"' src/foundation/__init__.py
-
-      - name: Set up Python 3.13
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
 
       - name: Install dependencies
         run: |
