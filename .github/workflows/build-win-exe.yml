@@ -1,0 +1,136 @@
+# Builds a single-file Windows x64 executable for the customized icloudpd.
+#
+# This repository does NOT carry the upstream source. It only carries the small
+# set of files that differ from upstream (see custom/). The job fetches upstream
+# at a pinned commit, applies those files, and packages the result with
+# PyInstaller. The finished icloudpd-win.exe is attached to a release so it can
+# be downloaded directly.
+
+name: Build Windows exe (x64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "custom/**"
+      - ".github/workflows/build-win-exe.yml"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: icloud-photos-downloader/icloud_photos_downloader
+  UPSTREAM_SHA: 879c561240d993d748ddb4546f935090502b16d3
+  ICLOUDPD_VERSION: "1.32.3"
+  ICLOUDPD_COMMIT_SHA: "879c561"
+  ICLOUDPD_COMMIT_TS: "1780177342"
+
+jobs:
+  build-win-x64:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream source at the pinned commit
+        run: |
+          curl -sSL -o up.tar.gz \
+            "https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/${UPSTREAM_SHA}"
+          mkdir -p build
+          tar xzf up.tar.gz -C build --strip-components=1
+          ls build | head -20
+
+      - name: Apply the customizations
+        run: |
+          cd build
+          git init -q .
+          git apply -p1 --verbose ../custom/icloudpd-custom.patch
+          cp ../custom/guided_setup.py src/icloudpd/guided_setup.py
+          cp ../custom/remember.py src/icloudpd/remember.py
+
+      - name: Bake version info
+        run: |
+          cd build
+          python - "$ICLOUDPD_VERSION" "$ICLOUDPD_COMMIT_SHA" "$ICLOUDPD_COMMIT_TS" <<'PY'
+          import pathlib
+          import sys
+
+          version, sha, ts = sys.argv[1], sys.argv[2], sys.argv[3]
+          path = pathlib.Path("src/foundation/__init__.py")
+          text = path.read_text()
+          text = text.replace('version="0.0.1"', f'version="{version}"')
+          text = text.replace('commit_sha="abcdefgh"', f'commit_sha="{sha}"')
+          text = text.replace("commit_timestamp=1234567890", f"commit_timestamp={ts}")
+          path.write_text(text)
+          print(text[text.index("version_info = VersionInfo") :][:200])
+          PY
+
+      - name: Sanity-check the customizations landed
+        run: |
+          cd build
+          test -f src/icloudpd/guided_setup.py
+          test -f src/icloudpd/remember.py
+          grep -n 'default="original"' src/icloudpd/cli.py
+          grep -n 'version="1.32.3"' src/foundation/__init__.py
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          cd build
+          python -m pip install --disable-pip-version-check --upgrade "pip>=25.1"
+          python -m pip install --disable-pip-version-check -r requirements-pip.txt
+          python -m pip install --disable-pip-version-check -e . --group dev
+          pyinstaller --version
+
+      - name: Build the single-file executable
+        run: |
+          cd build
+          bash scripts/build_bin1 icloudpd
+          ls -la dist
+
+      - name: Collect the artifact
+        run: |
+          cd build
+          mkdir -p out
+          cp dist/icloudpd.exe out/icloudpd-win.exe
+          cd out
+          python - <<'PY'
+          import hashlib
+          import pathlib
+
+          path = pathlib.Path("icloudpd-win.exe")
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          pathlib.Path("icloudpd-win.exe.sha256").write_text(
+              f"{digest}  icloudpd-win.exe\n"
+          )
+          print("sha256:", digest)
+          print("bytes :", path.stat().st_size)
+          PY
+          ls -la
+
+      - name: Upload as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: icloudpd-win-x64
+          if-no-files-found: error
+          path: build/out/*
+
+      - name: Attach to a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd build/out
+          TAG="win-x64-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" \
+            --title "icloudpd-win.exe (x64) - build ${GITHUB_RUN_NUMBER}" \
+            --notes "Automated Windows x64 build. Upstream ${UPSTREAM_REPO} at ${UPSTREAM_SHA}. Customizations: guided setup, remembered Apple ID and directory, live photo filename policy default = original, no keyring in the guided password prompt." \
+            icloudpd-win.exe icloudpd-win.exe.sha256
