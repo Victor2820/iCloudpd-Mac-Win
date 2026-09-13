@@ -1,0 +1,152 @@
+--- a/src/icloudpd/cli.py
++++ b/src/icloudpd/cli.py
+@@ -12,8 +12,20 @@
+ import foundation
+ from foundation.core import chain_from_iterable, compose, map_, partial_1_1, skip
+ from foundation.string_utils import lower
++from icloudpd import remember
+ from icloudpd.base import ensure_tzinfo, run_with_configs
+ from icloudpd.config import GlobalConfig, UserConfig
++from icloudpd.guided_setup import (
++    GUIDED_FLAG,
++    NO_REMEMBER_FLAG,
++    GuidedAnswers,
++    GuidedSetupCancelled,
++    apply_answers,
++    has_username_option,
++    is_interactive,
++    run_guided_setup,
++    should_run_guided_setup,
++)
+ from icloudpd.log_level import LogLevel
+ from icloudpd.mfa_provider import MFAProvider
+ from icloudpd.password_provider import PasswordProvider
+@@ -222,7 +234,7 @@
+         "--live-photo-mov-filename-policy",
+         help="How to produce filenames for the video portion of live photos: `suffix` will add _HEVC suffix and `original` will keep the filename as is. Default: %(default)s",
+         choices=["suffix", "original"],
+-        default="suffix",
++        default="original",
+         type=lower,
+     )
+     cloned.add_argument(
+@@ -296,6 +308,24 @@
+     group.add_argument("--help", "-h", action="store_true", help="Show this information")
+     group.add_argument(
+         "--version", help="Show the version, commit hash, and timestamp", action="store_true"
++    )
++    guided_group = cloned.add_mutually_exclusive_group()
++    guided_group.add_argument(
++        "--guided",
++        action="store_true",
++        help="Always run the guided setup that asks for Apple ID, password, iCloud domain, "
++        "download directory and the most common download options",
++    )
++    guided_group.add_argument(
++        "--no-guided",
++        action="store_true",
++        help="Never run the guided setup (default: run it when started in a terminal "
++        "without any arguments)",
++    )
++    cloned.add_argument(
++        "--no-remember",
++        action="store_true",
++        help="Do not read or write the remembered Apple ID and download directory",
+     )
+     cloned.add_argument(
+         "--use-os-locale", help="Use the locale of the host OS to format dates", action="store_true"
+@@ -533,9 +563,53 @@
+     )
+ 
+ 
++def _explicit_password_providers(args: Sequence[str]) -> bool:
++    """True when the command line itself listed the password providers."""
++    return any(
++        arg == "--password-provider" or arg.startswith("--password-provider=") for arg in args
++    )
++
++
++def _remember_successful_run(global_ns: GlobalConfig, user_nses: Sequence[UserConfig]) -> None:
++    """Keep the Apple ID and the download directory of a run that finished cleanly.
++
++    Least privilege: only those two values, and only from runs that really touch
++    the library. Preview and dry runs are skipped because they are typically
++    pointed at throwaway paths, and a configuration without both values has
++    nothing worth keeping. A multi-account run remembers its first configuration.
++    """
++    if global_ns.only_print_filenames:
++        return
++    for user_ns in user_nses:
++        if user_ns.dry_run or not user_ns.username or not user_ns.directory:
++            continue
++        remember.save(user_ns.username, user_ns.directory)
++        return
++
++
+ def cli() -> int:
++    args = list(sys.argv[1:])
++    # least privilege: --no-remember keeps the remembered values out of this run,
++    # in both directions (nothing is read, nothing is written)
++    remember_disabled = NO_REMEMBER_FLAG in args
++
++    # optional guided setup for interactive usage
++    answers: GuidedAnswers | None = None
++    if should_run_guided_setup(args):
++        try:
++            answers = run_guided_setup(args, None if remember_disabled else remember.load())
++        except (GuidedSetupCancelled, KeyboardInterrupt):
++            print("\n已取消。")
++            return 1
++        if answers.username and not has_username_option(args):
++            # prepend so that options which are only valid per account (e.g. --password)
++            # stay inside this account's group instead of falling into the defaults group
++            args = ["-u", answers.username, *args]
++    elif GUIDED_FLAG in args:
++        print("引导设置一次只支持一个账号，检测到多个 --username，已跳过引导设置。")
++
+     try:
+-        global_ns, user_nses = parse(sys.argv[1:])
++        global_ns, user_nses = parse(args)
+     except argparse.ArgumentError as error:
+         print(error)
+         return 2
+@@ -552,6 +626,18 @@
+         print(foundation.version_info_formatted())
+         return 0
+     else:
++        if answers is not None:
++            # user_nses has exactly one entry here: multi-account command lines skip the setup
++            apply_answers(answers, global_ns, user_nses[0] if len(user_nses) == 1 else None)
++            if not _explicit_password_providers(args):
++                # the wizard asked for the password itself, so the keyring is not
++                # consulted; listing --password-provider explicitly still wins
++                global_ns.password_providers = [
++                    provider
++                    for provider in global_ns.password_providers
++                    if provider is not PasswordProvider.KEYRING
++                ]
++
+         # check param compatibility
+         if [user_ns for user_ns in user_nses if user_ns.skip_videos and user_ns.skip_photos]:
+             print(
+@@ -571,6 +657,8 @@
+             print(
+                 "--auth-only, --directory, --list-libraries, or --list-albums are required for each configuration"
+             )
++            if is_interactive():
++                print("提示：不带任何参数运行本程序会进入引导设置，逐项询问这些参数。")
+             return 2
+ 
+         elif [
+@@ -606,7 +694,10 @@
+             )
+             return 2
+         else:
+-            return run_with_configs(global_ns, user_nses)
++            exit_code = run_with_configs(global_ns, user_nses)
++            if exit_code == 0 and not remember_disabled:
++                _remember_successful_run(global_ns, user_nses)
++            return exit_code
+ 
+ 
+ def validate_folder_structure(folder_structure: str) -> str:
