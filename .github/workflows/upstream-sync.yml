@@ -1,0 +1,166 @@
+# Keeps this repository in step with upstream.
+#
+# This repository carries only the files that differ from upstream (see custom/),
+# plus the two build workflows, which pin an upstream commit in their `env` block
+# and hard-code the sha256 of the patched sources in their Verify step.  So
+# "updating" means moving three things together:
+#
+#     the four pins in both build workflows
+#     custom/icloudpd-custom.patch, rebased onto the new src/icloudpd/cli.py
+#     the sha256 values the Verify steps assert
+#
+# scripts/upstream_sync.py does that with a real three-way merge.  This workflow
+# runs it weekly, commits the result, and kicks off fresh builds.
+#
+# Two things it deliberately will NOT do:
+#   * invent a resolution when the rebase conflicts - it opens an issue instead
+#   * publish a binary it could not verify     - the builds do the packaging
+#
+# Commits pushed with the default GITHUB_TOKEN do not trigger other workflows,
+# which is why the builds are dispatched explicitly rather than left to the
+# `push` trigger they also have.
+
+name: Sync with upstream
+
+on:
+  schedule:
+    # Mondays at 03:17 UTC (11:17 in Beijing).  Off the hour on purpose: GitHub
+    # queues a lot of scheduled work at :00 and the run gets delayed.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      to:
+        description: "Upstream tag or commit to move to.  Blank means the latest release."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: write
+  issues: write
+
+concurrency:
+  group: upstream-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BUILD_WORKFLOWS: build-win-exe.yml build-mac-bin.yml
+  # Only these are ever committed; the conflict scratch file is not.
+  SYNCED_FILES: custom/icloudpd-custom.patch custom/guided_setup.py custom/remember.py
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Rebase the customizations onto the newest upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ inputs.to }}
+        run: |
+          args=(--report "$RUNNER_TEMP/sync.json")
+          if [ -n "$TARGET" ]; then
+            args+=(--to "$TARGET")
+          fi
+
+          python scripts/upstream_sync.py "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/sync.log"
+          code=${PIPESTATUS[0]}
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+
+          if [ -f "$RUNNER_TEMP/sync.json" ]; then
+            {
+              echo "updated=$(jq -r '.updated // false' "$RUNNER_TEMP/sync.json")"
+              echo "version=$(jq -r '.pins.ICLOUDPD_VERSION // ""' "$RUNNER_TEMP/sync.json")"
+              echo "message=$(jq -r '.message // ""' "$RUNNER_TEMP/sync.json" | tr '\n' ' ')"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+          # Never fail here: the steps below decide what an exit code means.
+          exit 0
+
+      - name: Commit the new pins and the rebased patch
+        if: steps.sync.outputs.exit_code == '0' && steps.sync.outputs.updated == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # shellcheck disable=SC2086
+          git add $SYNCED_FILES .github/workflows/build-win-exe.yml .github/workflows/build-mac-bin.yml
+
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+            exit 0
+          fi
+
+          git commit -m "Sync with upstream ${ICLOUDPD_VERSION}" \
+                     -m "${{ steps.sync.outputs.message }}"
+          git push
+        env:
+          ICLOUDPD_VERSION: ${{ steps.sync.outputs.version }}
+
+      - name: Rebuild the binaries
+        if: steps.sync.outputs.exit_code == '0' && steps.sync.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for workflow in $BUILD_WORKFLOWS; do
+            echo "dispatching $workflow"
+            gh workflow run "$workflow" --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+          done
+
+      - name: Open an issue when the rebase needs a human
+        if: steps.sync.outputs.exit_code == '3'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          title="Upstream sync needs a hand"
+
+          {
+            echo "The weekly sync could not rebase the customizations onto the newest"
+            echo "upstream release by itself, so nothing was committed."
+            echo
+            echo "\`\`\`"
+            tail -c 6000 "$RUNNER_TEMP/sync.log"
+            echo "\`\`\`"
+            echo
+            echo "To finish it locally:"
+            echo
+            echo "\`\`\`bash"
+            echo "python scripts/upstream_sync.py --to <tag>     # writes cli.py.conflict"
+            echo "# resolve the markers in cli.py.conflict, then:"
+            echo "python scripts/upstream_sync.py --to <tag> --resolve cli.py.conflict"
+            echo "\`\`\`"
+            echo
+            echo "Then commit \`custom/\` and the two build workflows and run:"
+            echo
+            echo "\`\`\`bash"
+            echo "gh workflow run build-win-exe.yml"
+            echo "gh workflow run build-mac-bin.yml"
+            echo "\`\`\`"
+          } > "$RUNNER_TEMP/issue.md"
+
+          existing=$(gh issue list --state open --search "in:title \"$title\"" \
+                       --json number --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            echo "adding to issue #$existing"
+            gh issue comment "$existing" --body-file "$RUNNER_TEMP/issue.md"
+          else
+            gh issue create --title "$title" --body-file "$RUNNER_TEMP/issue.md"
+          fi
+
+      - name: Fail the run when the sync needs attention
+        if: steps.sync.outputs.exit_code != '0'
+        run: |
+          echo "upstream_sync.py exited ${{ steps.sync.outputs.exit_code }}: ${{ steps.sync.outputs.message }}"
+          exit 1
