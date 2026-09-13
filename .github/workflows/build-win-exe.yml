@@ -13,7 +13,9 @@ on:
   push:
     branches: [ main ]
     paths:
-      - "custom/**"
+      - "custom/icloudpd-custom.patch"
+      - "custom/guided_setup.py"
+      - "custom/remember.py"
       - ".github/workflows/build-win-exe.yml"
 
 permissions:
