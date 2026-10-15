@@ -4,7 +4,7 @@
 workflow 会按 pin 的 commit 拉上游 tarball，把差异打进去，再用 PyInstaller 打包。
 
 上游 pin：`icloud-photos-downloader/icloud_photos_downloader` @ `879c561`（v1.32.3），
-写在三个 workflow 的 `env:` 块里（改 pin 必须三个一起改）。
+写在三个 build workflow 与 docker workflow 的 `env:` 块里（改 pin 必须四个一起改）。
 
 ## 内容
 
@@ -18,6 +18,11 @@ workflow 会按 pin 的 commit 拉上游 tarball，把差异打进去，再用 P
 | `.github/workflows/build-win-exe.yml` | Windows x64 单文件 exe |
 | `.github/workflows/build-linux-bin.yml` | Linux x86_64 + arm64 单文件可执行程序（ubuntu-22.04 / -arm，glibc 2.35） |
 | `.github/workflows/build-mac-bin.yml` | macOS arm64 + x86_64 单文件可执行程序 |
+| `.github/workflows/docker-build.yml` | 容器镜像（linux/amd64 + arm64）→ ghcr.io |
+| `custom/Dockerfile` | 镜像构建（多阶段，pip 安装而非拷二进制） |
+| `custom/apply_customizations.sh` | 打补丁 + 注入版本 + 自检（镜像构建用） |
+| `custom/docker-entrypoint.sh` | 容器入口：有参数时自动补 `--no-pause` |
+| `custom/DOCKER.md` | 镜像用法说明 |
 | `.github/workflows/upstream-sync.yml` | 每周检查上游是否有新版 |
 
 ## 定制点
@@ -33,14 +38,15 @@ workflow 会按 pin 的 commit 拉上游 tarball，把差异打进去，再用 P
 
 ## 怎么触发构建
 
-三个 workflow 都有 `workflow_dispatch`，在仓库 Actions 页面选对应 workflow
+四个 workflow 都有 `workflow_dispatch`，在仓库 Actions 页面选对应 workflow
 点 `Run workflow` 即可（分支选 `main`）。产物会挂到 release 上。
 推到 `main` 且改动落在 `custom/` 或 workflow 文件时也会自动触发。
 
 ## 改动后要注意
 
 - 改任一个被打补丁的文件，都要重新生成 `custom/icloudpd-custom.patch`，
-  并同步三个 workflow 里 "Verify" 步骤的 sha256。
+  并同步三个 workflow 里 "Verify" 步骤的 sha256（docker 那个只带 pin，不带哈希，
+靠镜像冒烟测试保证定制生效）。
 - workflow 的 Verify 步骤**必须**保持 `echo "<hash>  <path>" | sha256sum -c -`
   的逐行写法，`scripts/upstream_sync.py` 靠正则匹配这些行来更新哈希。
 - `scripts/upstream_sync.py` 目前只 rebase `src/icloudpd/cli.py`；补丁一旦包含

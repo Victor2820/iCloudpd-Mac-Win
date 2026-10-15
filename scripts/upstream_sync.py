@@ -88,6 +88,12 @@ WORKFLOWS = (
     ".github/workflows/build-linux-bin.yml",
 )
 
+# Workflows that carry the upstream pins but assert no sha256 - the image build
+# proves the customizations landed by smoke-testing the pushed image instead of
+# by hashing files. They still have to move when the pin does, otherwise the
+# image silently keeps building the old upstream.
+PIN_ONLY_WORKFLOWS = (".github/workflows/docker-build.yml",)
+
 # Upstream files the patch modifies on top of cli.py. The workflows assert a hash
 # for each of them too, so a rebase has to carry them along.
 PATCHED_EXTRA = (
@@ -590,9 +596,13 @@ def main(argv: list[str] | None = None) -> int:
         report["root"] = str(root)
 
         # ---- where we are now -------------------------------------------------
-        workflow_texts = {rel: workflow_text(root, rel) for rel in WORKFLOWS}
+        workflow_texts = {rel: workflow_text(root, rel) for rel in WORKFLOWS + PIN_ONLY_WORKFLOWS}
         pins = {rel: read_pins(text, rel) for rel, text in workflow_texts.items()}
-        baseline = {rel: read_expected_hashes(text, rel) for rel, text in workflow_texts.items()}
+        baseline = {
+            rel: read_expected_hashes(text, rel)
+            for rel, text in workflow_texts.items()
+            if rel in WORKFLOWS
+        }
 
         current_sha = pins[WORKFLOWS[0]]["UPSTREAM_SHA"]
         if args.source:
