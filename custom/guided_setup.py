@@ -18,9 +18,14 @@ password out of the process list.
 The Apple ID and the download directory are offered as defaults when the last
 successful run remembered them (see :mod:`icloudpd.remember`). Pass
 ``--no-remember`` to switch that off.
+
+The module also owns the terminal check and the "press any key to exit" prompt
+used after a run that was started from a file manager, where the console would
+otherwise close before the result could be read. Pass ``--no-pause`` to skip it.
 """
 
 import getpass
+import os
 import pathlib
 import sys
 from dataclasses import dataclass, field
@@ -45,6 +50,12 @@ WATCH_FLAGS: Sequence[str] = ["--watch-with-interval"]
 GUIDED_FLAG = "--guided"
 NO_GUIDED_FLAG = "--no-guided"
 NO_REMEMBER_FLAG = "--no-remember"
+NO_PAUSE_FLAG = "--no-pause"
+
+# Flags that only tune how an interactive run behaves. On their own they are not
+# a request to download anything, so they must not switch the wizard off -- and
+# therefore they are not "meaningful" arguments (see ``_meaningful_args``).
+_BEHAVIOUR_FLAGS = (NO_REMEMBER_FLAG, NO_PAUSE_FLAG)
 
 # Tokens that clear an optional numeric setting instead of setting it to a number.
 _NONE_TOKENS = {"0", "none", "-", "no", "不", "全部", "无"}
@@ -86,6 +97,60 @@ def is_interactive() -> bool:
     except (AttributeError, ValueError):
         # pytest replaces stdio with capture objects that may not support isatty()
         return False
+
+
+def _read_key() -> None:
+    """Block until a single key is pressed, without needing Enter."""
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.getch()
+        return
+
+    import termios
+    import tty
+
+    descriptor = sys.stdin.fileno()
+    settings = termios.tcgetattr(descriptor)
+    try:
+        # Raw mode makes Enter count as "any key" and returns Ctrl-C as a byte
+        # instead of raising, which is what we want for a final prompt.
+        tty.setraw(descriptor)
+        os.read(descriptor, 1)
+    finally:
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, settings)
+
+
+def wait_for_exit(message: str = "按任意键退出 ...") -> None:
+    """Hold the window open until a key is pressed.
+
+    Started from a file manager the console would otherwise vanish the moment
+    the run ends, taking the result summary with it. This only makes sense when
+    a human is actually in front of a terminal: a run whose stdio is a pipe or a
+    file (cron, a wrapper script, CI) must never block on a key that is never
+    going to come. Pass ``--no-pause`` to opt out even in a terminal.
+    """
+    if not is_interactive():
+        return
+
+    try:
+        print()
+        print(message, end="", flush=True)
+    except (OSError, ValueError):
+        return
+
+    try:
+        _read_key()
+    except (EOFError, KeyboardInterrupt):
+        # the user is already on their way out; nothing to hold open any more
+        return
+    except (OSError, ValueError):
+        return
+
+    try:
+        print()
+    except (OSError, ValueError):
+        pass
 
 
 def _flag_values(args: Sequence[str], flags: Sequence[str]) -> list[str]:
@@ -141,14 +206,15 @@ def _directory_required_by_mode(args: Sequence[str]) -> bool:
 
 
 def _meaningful_args(args: Sequence[str]) -> list[str]:
-    """Arguments that express intent, i.e. everything but the memory opt-out.
+    """Arguments that express intent, i.e. everything but the behaviour flags.
 
-    ``--no-remember`` only says "do not keep my Apple ID and directory around";
-    it is not a request to download something, so it must not switch the wizard
-    off. Otherwise opting out of remembering would also cost the user the very
+    ``--no-remember`` only says "do not keep my Apple ID and directory around"
+    and ``--no-pause`` only says "do not wait for a key at the end"; neither is
+    a request to download something, so they must not switch the wizard off.
+    Otherwise opting out of remembering would also cost the user the very
     wizard it is meant to configure.
     """
-    return [arg for arg in args if arg != NO_REMEMBER_FLAG]
+    return [arg for arg in args if arg not in _BEHAVIOUR_FLAGS]
 
 
 def _needs_guided_setup(args: Sequence[str]) -> bool:

@@ -3,13 +3,18 @@
 
 The build repository never carries upstream source.  All it carries is
 
-    custom/icloudpd-custom.patch     the diff applied to src/icloudpd/cli.py
+    custom/icloudpd-custom.patch     the diff applied to the upstream sources
     custom/guided_setup.py           new module - the interactive wizard
     custom/remember.py               new module - the minimal remembered state
 
 plus two workflows that pin the upstream commit in their `env` block and
-hard-code, in their "Verify" step, the sha256 of those three files *after*
-the patch has been applied.
+hard-code, in their "Verify" step, the sha256 of every patched file and of
+those two added modules, all *after* the patch has been applied.
+
+The patch is no longer cli.py alone (it also carries the indexing wait and the
+exit-code fix), and this script still only rebases cli.py. It therefore refuses
+to run at all while the patch touches anything else - see PATCHED_EXTRA - rather
+than rewriting the patch from the merged cli.py and dropping the rest.
 
 When upstream cuts a release, three things have to move together:
 
@@ -82,8 +87,18 @@ WORKFLOWS = (
     ".github/workflows/build-mac-bin.yml",
 )
 
+# Upstream files the patch modifies on top of cli.py. The workflows assert a hash
+# for each of them too, so a rebase has to carry them along.
+PATCHED_EXTRA = (
+    "src/icloudpd/base.py",
+    "src/icloudpd/config.py",
+    "src/pyicloud_ipd/base.py",
+    "src/pyicloud_ipd/services/photos.py",
+    "src/starters/icloudpd.py",
+)
+
 # Every file the Verify step asserts a hash for.
-VERIFIED = (CLI_REL, *CARRIED.values())
+VERIFIED = (CLI_REL, *PATCHED_EXTRA, *CARRIED.values())
 
 # The pin keys, and how each one is rendered back into the workflow's env block.
 ENV_SPEC = {
@@ -352,6 +367,15 @@ def conflict_report(merged: str) -> str:
     return "\n".join(out)
 
 
+def patched_rels(patch_text: str) -> list[str]:
+    """Every upstream file the patch touches, in the order the hunks appear."""
+    rels: list[str] = []
+    for match in re.finditer(r"^--- a/(\S+)", patch_text, re.M):
+        if match.group(1) not in rels:
+            rels.append(match.group(1))
+    return rels
+
+
 def unified_diff(old: str, new: str, path: str) -> str:
     return "".join(
         difflib.unified_diff(
@@ -595,6 +619,22 @@ def main(argv: list[str] | None = None) -> int:
             log("\nalready up to date - nothing to do.")
             report["message"] = "already up to date"
             return 0
+
+        # The rebase below is cli.py only. If the patch has grown past that, running
+        # it would rewrite the patch from the merged cli.py alone and silently drop
+        # every other customization - a wrong binary that still builds green. Refuse
+        # instead. (While we are pinned to the newest release this is never reached,
+        # so the weekly check stays quiet.)
+        patch_file = root / PATCH_REL
+        if patch_file.is_file():
+            extra = [rel for rel in patched_rels(patch_file.read_text(encoding="utf-8")) if rel != CLI_REL]
+            if extra:
+                raise SyncError(
+                    f"{PATCH_REL} now covers {', '.join([CLI_REL, *extra])}. This script only "
+                    f"rebases {CLI_REL}; carrying the rest over needs a hand. Move the pins, "
+                    f"re-generate the patch against the new upstream tree, and update the "
+                    f"Verify hashes - or generalise this script to merge every patched file."
+                )
 
         if args.check:
             log("\na newer upstream release is available.")

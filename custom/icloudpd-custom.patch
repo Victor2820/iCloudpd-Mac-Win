@@ -1,6 +1,23 @@
+diff --git a/src/icloudpd/base.py b/src/icloudpd/base.py
+index 2c9fe24..5e295a4 100644
+--- a/src/icloudpd/base.py
++++ b/src/icloudpd/base.py
+@@ -921,6 +921,10 @@ def core_single_run(
+             # turn off response capture
+             icloud.response_observer = None
+ 
++            # Must be set before the first `icloud.photos` access: that property is what
++            # constructs PhotosService, which is where the indexing check happens.
++            icloud.ignore_indexing_state = user_config.ignore_indexing_state
++
+             if user_config.auth_only:
+                 logger.info("Authentication completed successfully")
+                 return 0
+diff --git a/src/icloudpd/cli.py b/src/icloudpd/cli.py
+index 9c33ac1..e021bd4 100644
 --- a/src/icloudpd/cli.py
 +++ b/src/icloudpd/cli.py
-@@ -12,8 +12,20 @@
+@@ -12,8 +12,22 @@ from tzlocal import get_localzone
  import foundation
  from foundation.core import chain_from_iterable, compose, map_, partial_1_1, skip
  from foundation.string_utils import lower
@@ -9,6 +26,7 @@
  from icloudpd.config import GlobalConfig, UserConfig
 +from icloudpd.guided_setup import (
 +    GUIDED_FLAG,
++    NO_PAUSE_FLAG,
 +    NO_REMEMBER_FLAG,
 +    GuidedAnswers,
 +    GuidedSetupCancelled,
@@ -17,11 +35,28 @@
 +    is_interactive,
 +    run_guided_setup,
 +    should_run_guided_setup,
++    wait_for_exit,
 +)
  from icloudpd.log_level import LogLevel
  from icloudpd.mfa_provider import MFAProvider
  from icloudpd.password_provider import PasswordProvider
-@@ -222,7 +234,7 @@
+@@ -130,6 +144,15 @@ def add_options_for_user(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
+         + "(If you restore the photo in iCloud, it will be downloaded again.)",
+         action="store_true",
+     )
++    cloned.add_argument(
++        "--ignore-indexing-state",
++        help="Continue even if Apple reports the photo library as not fully indexed. "
++        + "Use only when the check itself is unreliable (see issue #1387): Apple can "
++        + "answer RUNNING for a library that is in fact ready. The asset listing may be "
++        + "incomplete, so this cannot be combined with --auto-delete or "
++        + "--keep-icloud-recent-days.",
++        action="store_true",
++    )
+     cloned.add_argument(
+         "--folder-structure",
+         help="Folder structure. If set to `none`, all photos will be placed into the download directory. Default: %(default)s",
+@@ -222,7 +245,7 @@ def add_options_for_user(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
          "--live-photo-mov-filename-policy",
          help="How to produce filenames for the video portion of live photos: `suffix` will add _HEVC suffix and `original` will keep the filename as is. Default: %(default)s",
          choices=["suffix", "original"],
@@ -30,11 +65,10 @@
          type=lower,
      )
      cloned.add_argument(
-@@ -296,6 +308,24 @@
-     group.add_argument("--help", "-h", action="store_true", help="Show this information")
+@@ -297,6 +320,29 @@ def add_global_options(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
      group.add_argument(
          "--version", help="Show the version, commit hash, and timestamp", action="store_true"
-+    )
+     )
 +    guided_group = cloned.add_mutually_exclusive_group()
 +    guided_group.add_argument(
 +        "--guided",
@@ -52,10 +86,24 @@
 +        "--no-remember",
 +        action="store_true",
 +        help="Do not read or write the remembered Apple ID and download directory",
-     )
++    )
++    cloned.add_argument(
++        "--no-pause",
++        action="store_true",
++        help="Leave the console as soon as the run ends instead of waiting for a key press",
++    )
      cloned.add_argument(
          "--use-os-locale", help="Use the locale of the host OS to format dates", action="store_true"
-@@ -533,9 +563,53 @@
+     )
+@@ -450,6 +496,7 @@ def map_to_config(user_ns: argparse.Namespace) -> UserConfig:
+         xmp_sidecar=user_ns.xmp_sidecar,
+         force_size=user_ns.force_size,
+         auto_delete=user_ns.auto_delete,
++        ignore_indexing_state=user_ns.ignore_indexing_state,
+         folder_structure=user_ns.folder_structure,
+         set_exif_datetime=user_ns.set_exif_datetime,
+         smtp_username=user_ns.smtp_username,
+@@ -533,9 +580,55 @@ def parse(args: Sequence[str]) -> Tuple[GlobalConfig, Sequence[UserConfig]]:
      )
  
  
@@ -88,6 +136,8 @@
 +    # least privilege: --no-remember keeps the remembered values out of this run,
 +    # in both directions (nothing is read, nothing is written)
 +    remember_disabled = NO_REMEMBER_FLAG in args
++    # --no-pause: leave the console as soon as the run is over
++    pause_disabled = NO_PAUSE_FLAG in args
 +
 +    # optional guided setup for interactive usage
 +    answers: GuidedAnswers | None = None
@@ -110,7 +160,7 @@
      except argparse.ArgumentError as error:
          print(error)
          return 2
-@@ -552,6 +626,18 @@
+@@ -552,6 +645,18 @@ def cli() -> int:
          print(foundation.version_info_formatted())
          return 0
      else:
@@ -129,7 +179,7 @@
          # check param compatibility
          if [user_ns for user_ns in user_nses if user_ns.skip_videos and user_ns.skip_photos]:
              print(
-@@ -571,6 +657,8 @@
+@@ -571,6 +676,8 @@ def cli() -> int:
              print(
                  "--auth-only, --directory, --list-libraries, or --list-albums are required for each configuration"
              )
@@ -138,7 +188,33 @@
              return 2
  
          elif [
-@@ -606,7 +694,10 @@
+@@ -593,6 +700,25 @@ def cli() -> int:
+             )
+             return 2
+ 
++        elif [user_ns for user_ns in user_nses if user_ns.auto_delete and user_ns.ignore_indexing_state]:
++            print(
++                "--ignore-indexing-state cannot be combined with --auto-delete: an incomplete "
++                "asset listing could make it delete photos that were never downloaded"
++            )
++            return 2
++
++        elif [
++            user_ns
++            for user_ns in user_nses
++            if user_ns.keep_icloud_recent_days is not None
++            and user_ns.ignore_indexing_state
++        ]:
++            print(
++                "--ignore-indexing-state cannot be combined with --keep-icloud-recent-days: an "
++                "incomplete asset listing could make it delete photos that were never downloaded"
++            )
++            return 2
++
+         elif global_ns.watch_with_interval and (
+             [
+                 user_ns
+@@ -606,7 +732,15 @@ def cli() -> int:
              )
              return 2
          else:
@@ -146,7 +222,337 @@
 +            exit_code = run_with_configs(global_ns, user_nses)
 +            if exit_code == 0 and not remember_disabled:
 +                _remember_successful_run(global_ns, user_nses)
++            if not pause_disabled:
++                # a console opened from a file manager closes the moment the
++                # program returns, taking the result summary with it. Pipes,
++                # cron and CI are not held up (see wait_for_exit).
++                wait_for_exit()
 +            return exit_code
  
  
  def validate_folder_structure(folder_structure: str) -> str:
+diff --git a/src/icloudpd/config.py b/src/icloudpd/config.py
+index 0198438..2a7ce8f 100644
+--- a/src/icloudpd/config.py
++++ b/src/icloudpd/config.py
+@@ -30,6 +30,7 @@ class _DefaultConfig:
+     xmp_sidecar: bool
+     force_size: bool
+     auto_delete: bool
++    ignore_indexing_state: bool
+     folder_structure: str
+     set_exif_datetime: bool
+     smtp_username: str | None
+diff --git a/src/pyicloud_ipd/base.py b/src/pyicloud_ipd/base.py
+index 409460e..a66271e 100644
+--- a/src/pyicloud_ipd/base.py
++++ b/src/pyicloud_ipd/base.py
+@@ -279,6 +279,10 @@ class PyiCloudService:
+ 
+         self._photos: PhotosService | None = None
+ 
++        # May be flipped by the CLI before the first `.photos` access so that a library
++        # Apple refuses to report as FINISHED can still be listed (#1387).
++        self.ignore_indexing_state: bool = False
++
+     @contextmanager
+     def use_rules(self, rules: Sequence[Rule]) -> Generator[Sequence[Rule], Any, None]:
+         temp_rules = self.observer_rules
+@@ -896,7 +900,12 @@ class PyiCloudService:
+         """Gets the 'Photo' service."""
+         if not self._photos:
+             service_root = self._get_webservice_url("ckdatabasews")
+-            self._photos = PhotosService(service_root, self.session, self.params)
++            self._photos = PhotosService(
++                service_root,
++                self.session,
++                self.params,
++                ignore_indexing_state=self.ignore_indexing_state,
++            )
+         return self._photos
+ 
+     def __unicode__(self) -> str:
+diff --git a/src/pyicloud_ipd/services/photos.py b/src/pyicloud_ipd/services/photos.py
+index 12e5c0b..edbefec 100644
+--- a/src/pyicloud_ipd/services/photos.py
++++ b/src/pyicloud_ipd/services/photos.py
+@@ -2,7 +2,9 @@ import base64
+ import copy
+ import json
+ import logging
++import os
+ import re
++import time
+ import typing
+ from datetime import datetime
+ from typing import Any, Callable, Dict, Generator, Sequence, Tuple, cast
+@@ -111,6 +113,32 @@ def filename_with_fallback(asset_id: str, item_type_extension: str) -> Callable[
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Apple 会反复重启照片索引任务（设备上传、照片 App 后台分析、共享库变动都会触发）：
++# 新任务一起，CheckIndexingState 就返回 RUNNING / progress=0，过一阵又回到 FINISHED / 100。
++# 上游对此做一次性快照，撞上 RUNNING 窗口就永久失败，成败全看运气。
++# 这里改成轮询等待。最长等待时间可用环境变量覆盖，设为 0 即恢复「不等待」的旧行为。
++_INDEXING_TIMEOUT_ENV = "ICLOUDPD_INDEXING_TIMEOUT"
++_DEFAULT_INDEXING_TIMEOUT = 300.0
++_INDEXING_POLL_INITIAL = 5.0
++_INDEXING_POLL_MAX = 30.0
++
++
++def _indexing_timeout_seconds() -> float:
++    """索引检查的最长等待秒数。默认 300，环境变量 ICLOUDPD_INDEXING_TIMEOUT 可覆盖。"""
++    raw = os.environ.get(_INDEXING_TIMEOUT_ENV)
++    if raw is None or raw.strip() == "":
++        return _DEFAULT_INDEXING_TIMEOUT
++    try:
++        value = float(raw)
++    except ValueError:
++        logger.warning(
++            "%s=%r 不是数字，回退到默认 %.0f 秒", _INDEXING_TIMEOUT_ENV, raw, _DEFAULT_INDEXING_TIMEOUT
++        )
++        return _DEFAULT_INDEXING_TIMEOUT
++    if value < 0:
++        return 0.0
++    return value
++
+ 
+ def download_asset(session: Session, url: str, start: int = 0) -> Response:
+     """
+@@ -277,12 +305,14 @@ class PhotoLibrary:
+         session: Session,
+         zone_id: Dict[str, Any],
+         library_type: str,
++        ignore_indexing_state: bool = False,
+     ):
+         self.service_endpoint = service_endpoint
+         self.params = params
+         self.session = session
+         self.zone_id = zone_id
+         self.library_type = library_type
++        self.ignore_indexing_state = ignore_indexing_state
+ 
+         url = f"{self.service_endpoint}/records/query?{urlencode(self.params)}"
+         json_data = json.dumps(
+@@ -292,13 +322,118 @@ class PhotoLibrary:
+             }
+         )
+ 
+-        request = self.session.post(url, data=json_data, headers={"Content-type": "text/plain"})
+-        response = request.json()
+-        indexing_state = response["records"][0]["fields"]["state"]["value"]
+-        if indexing_state != "FINISHED":
+-            raise PyiCloudServiceNotActivatedException(
+-                ("Apple iCloud Photo Library has not finished indexing yet"), None
++        zone_name = self.zone_id.get("zoneName") if self.zone_id else None
++
++        # Apple 会在设备上传 / 后台分析时反复重启索引任务：新任务一起（indexJobId 变化），
++        # state 就回到 RUNNING、progress 归零，过一阵又变回 FINISHED/100。
++        # 上游是一次性快照，撞上 RUNNING 的窗口就永久失败 —— 成败全看运气。
++        # 所以这里改成带指数退避的轮询等待；超时才放弃。
++        timeout = _indexing_timeout_seconds()
++        deadline = time.monotonic() + timeout
++        delay = _INDEXING_POLL_INITIAL
++        attempt = 0
++
++        while True:
++            attempt += 1
++            request = self.session.post(
++                url, data=json_data, headers={"Content-type": "text/plain"}
+             )
++            response = request.json()
++
++            logger.debug(
++                "CheckIndexingState raw response (zone=%s, library_type=%s, attempt=%d): %s",
++                zone_name,
++                self.library_type,
++                attempt,
++                json.dumps(response),
++            )
++
++            records = response.get("records") or []
++            if not records:
++                raise PyiCloudServiceNotActivatedException(
++                    (
++                        "Apple iCloud Photo Library returned no indexing record "
++                        f"(zone='{zone_name}', library_type='{self.library_type}'). "
++                        "This usually means 'iCloud Photos' is switched OFF for this "
++                        "account, or the account region does not match --domain."
++                    ),
++                    None,
++                )
++
++            fields = records[0].get("fields") or {}
++            indexing_state = (fields.get("state") or {}).get("value")
++            indexing_progress = (fields.get("progress") or {}).get("value")
++
++            if indexing_state == "FINISHED":
++                if attempt > 1:
++                    logger.info(
++                        "iCloud 照片索引已完成（zone=%s，第 %d 次检查，state=%r, progress=%r）",
++                        zone_name,
++                        attempt,
++                        indexing_state,
++                        indexing_progress,
++                    )
++                break
++
++            if self.ignore_indexing_state:
++                # 用户显式要求放行。Apple 的答案可能已经陈旧（#1387 里有账号永远返回
++                # RUNNING，但吞掉异常后列出与下载都正常），此时等待毫无意义。
++                # 只降级为警告，绝不静默通过 —— 日志要能说明资源列表可能不完整。
++                logger.warning(
++                    "Ignoring unfinished iCloud photo indexing as requested by "
++                    "--ignore-indexing-state (zone=%s, library_type=%s, state=%r, "
++                    "progress=%r). The asset listing may be incomplete; this option is "
++                    "refused together with any deletion option.",
++                    zone_name,
++                    self.library_type,
++                    indexing_state,
++                    indexing_progress,
++                )
++                break
++
++            if indexing_progress == 100:
++                # 进度已满却不是 FINISHED：说明 Apple 改了终态字符串，等也没用，
++                # 直接报错并把真实值带出来。
++                raise PyiCloudServiceNotActivatedException(
++                    (
++                        "Apple iCloud Photo Library reports indexing progress=100 but a "
++                        "state other than 'FINISHED'. The library is most likely indexed; "
++                        f"[diagnostics] zone='{zone_name}' library_type='{self.library_type}' "
++                        f"state={indexing_state!r} progress={indexing_progress!r} "
++                        f"endpoint={self.service_endpoint}"
++                    ),
++                    None,
++                )
++
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                raise PyiCloudServiceNotActivatedException(
++                    (
++                        "Apple iCloud Photo Library has not finished indexing yet "
++                        f"(waited {timeout:.0f}s over {attempt} checks). "
++                        f"[diagnostics] zone='{zone_name}' library_type='{self.library_type}' "
++                        f"state={indexing_state!r} progress={indexing_progress!r} "
++                        f"endpoint={self.service_endpoint}. "
++                        "Apple keeps restarting the indexing job — a device is probably "
++                        "uploading or the Photos app is analysing in the background. "
++                        f"Raise {_INDEXING_TIMEOUT_ENV}=<seconds> to wait longer."
++                    ),
++                    None,
++                )
++
++            sleep_for = min(delay, remaining)
++            logger.info(
++                "iCloud 照片索引尚未完成（zone=%s, state=%r, progress=%r），"
++                "%.0f 秒后重试（第 %d 次，最多再等 %.0f 秒）",
++                zone_name,
++                indexing_state,
++                indexing_progress,
++                sleep_for,
++                attempt,
++                remaining,
++            )
++            time.sleep(sleep_for)
++            delay = min(delay * 2, _INDEXING_POLL_MAX)
+ 
+     @property
+     def albums(self) -> Dict[str, "PhotoAlbum"]:
+@@ -397,10 +532,17 @@ class PhotosService(PhotoLibrary):
+     This also acts as a way to access the user's primary library.
+     """
+ 
+-    def __init__(self, service_root: str, session: PyiCloudSession, params: Dict[str, Any]):
++    def __init__(
++        self,
++        service_root: str,
++        session: PyiCloudSession,
++        params: Dict[str, Any],
++        ignore_indexing_state: bool = False,
++    ):
+         self.session = session
+         self.params = dict(params)
+         self._service_root = service_root
++        self._ignore_indexing_state = ignore_indexing_state
+ 
+         self._private_libraries: Dict[str, PhotoLibrary] | None = None
+         self._shared_libraries: Dict[str, PhotoLibrary] | None = None
+@@ -410,7 +552,14 @@ class PhotosService(PhotoLibrary):
+         # Initialize as primary library
+         service_endpoint = self.get_service_endpoint("private")
+         zone_id = {"zoneName": "PrimarySync"}
+-        super().__init__(service_endpoint, self.params, self.session, zone_id, "private")
++        super().__init__(
++            service_endpoint,
++            self.params,
++            self.session,
++            zone_id,
++            "private",
++            ignore_indexing_state=self._ignore_indexing_state,
++        )
+ 
+         # TODO: Does syncToken ever change?
+         # self.params.update({
+@@ -435,8 +584,11 @@ class PhotosService(PhotoLibrary):
+         return self._shared_libraries
+ 
+     def _fetch_libraries(self, library_type: str) -> Dict[str, PhotoLibrary]:
++        # NOTE: `libraries` must be initialised *outside* the try block. It used to live
++        # inside it, so any failure before the assignment (e.g. a failed POST) made the
++        # `return libraries` below blow up with UnboundLocalError, masking the real error.
++        libraries: Dict[str, PhotoLibrary] = {}
+         try:
+-            libraries = {}
+             service_endpoint = self.get_service_endpoint(library_type)
+             url = f"{service_endpoint}/zones/list"
+             request = self.session.post(url, data="{}", headers={"Content-type": "text/plain"})
+@@ -445,13 +597,22 @@ class PhotosService(PhotoLibrary):
+                 if not zone.get("deleted"):
+                     zone_name = zone["zoneID"]["zoneName"]
+                     service_endpoint = self.get_service_endpoint(library_type)
+-                    libraries[zone_name] = PhotoLibrary(
+-                        service_endpoint,
+-                        self.params,
+-                        self.session,
+-                        zone_id=zone["zoneID"],
+-                        library_type=library_type,
+-                    )
++                    # Per-zone try: constructing a PhotoLibrary runs the CheckIndexingState
++                    # query, and one un-indexed shared library used to abort the whole loop,
++                    # silently dropping every zone after it (looks like "photos went missing").
++                    try:
++                        libraries[zone_name] = PhotoLibrary(
++                            service_endpoint,
++                            self.params,
++                            self.session,
++                            zone_id=zone["zoneID"],
++                            library_type=library_type,
++                            ignore_indexing_state=self._ignore_indexing_state,
++                        )
++                    except Exception as e:
++                        logger.error(
++                            "Skipping %s library '%s': %s", library_type, zone_name, str(e)
++                        )
+                     # obj_type='CPLAssetByAssetDateWithoutHiddenOrDeleted',
+                     # list_type="CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
+                     # direction="ASCENDING", query_filter=None,
+diff --git a/src/starters/icloudpd.py b/src/starters/icloudpd.py
+index 1dc5acc..fa1da8e 100644
+--- a/src/starters/icloudpd.py
++++ b/src/starters/icloudpd.py
+@@ -1,6 +1,13 @@
+ #!/usr/bin/env python
+ 
++import sys
++
+ from icloudpd.cli import cli
+ 
+ if __name__ == "__main__":
+-    cli()
++    # `cli()` *returns* the exit code rather than raising SystemExit. Calling it bare
++    # discards the value, so every failure (unknown argument, mutually exclusive flags,
++    # login error) would still exit 0 and look like success to any wrapper script.
++    # Note this only affects PyInstaller builds: the pip console_scripts entry point
++    # declared in pyproject.toml wraps it properly.
++    sys.exit(cli())
