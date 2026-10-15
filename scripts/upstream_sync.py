@@ -85,6 +85,7 @@ CARRIED = {
 WORKFLOWS = (
     ".github/workflows/build-win-exe.yml",
     ".github/workflows/build-mac-bin.yml",
+    ".github/workflows/build-linux-bin.yml",
 )
 
 # Upstream files the patch modifies on top of cli.py. The workflows assert a hash

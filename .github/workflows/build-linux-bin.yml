@@ -1,0 +1,165 @@
+# Builds a single-file Linux x86_64 executable for the customized icloudpd.
+#
+# Same design as build-win-exe.yml: this repository does NOT carry the upstream
+# source. It only carries the files that differ from upstream (see custom/). The
+# job fetches upstream at a pinned commit, applies those files, and packages the
+# result with PyInstaller.
+#
+# PyInstaller cannot cross-compile, and a Linux binary is tied to the glibc of
+# the machine that built it. ubuntu-22.04 is pinned rather than ubuntu-latest
+# for exactly that reason: it carries glibc 2.35, so the result still runs on
+# Debian 12 / Ubuntu 22.04 and newer. Building on a newer runner would silently
+# produce a binary that refuses to start on anything older.
+
+name: Build Linux binary (x86_64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "custom/icloudpd-custom.patch"
+      - "custom/guided_setup.py"
+      - "custom/remember.py"
+      - ".github/workflows/build-linux-bin.yml"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: icloud-photos-downloader/icloud_photos_downloader
+  UPSTREAM_SHA: 879c561240d993d748ddb4546f935090502b16d3
+  ICLOUDPD_VERSION: "1.32.3"
+  ICLOUDPD_COMMIT_SHA: "879c561"
+  ICLOUDPD_COMMIT_TS: "1780177342"
+
+jobs:
+  build-linux-x86_64:
+    runs-on: ubuntu-22.04
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream source at the pinned commit
+        run: |
+          curl -sSL -o up.tar.gz \
+            "https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/${UPSTREAM_SHA}"
+          mkdir -p build
+          tar xzf up.tar.gz -C build --strip-components=1
+          ls build | head -20
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Apply the customizations
+        run: |
+          cd build
+          git init -q .
+          git apply -p1 --verbose ../custom/icloudpd-custom.patch
+          cp ../custom/guided_setup.py src/icloudpd/guided_setup.py
+          cp ../custom/remember.py src/icloudpd/remember.py
+
+      - name: Verify the customizations are byte for byte identical
+        run: |
+          cd build
+          sha256sum src/icloudpd/base.py src/icloudpd/cli.py src/icloudpd/config.py \
+            src/icloudpd/guided_setup.py src/icloudpd/remember.py \
+            src/pyicloud_ipd/base.py src/pyicloud_ipd/services/photos.py src/starters/icloudpd.py
+          echo "ad70556aaa9bbe820e02a2f3579431d2e336f44bbabaf4dff84589f0ce34493b  src/icloudpd/base.py" | sha256sum -c -
+          echo "bd0a6466d9b1b06a6623770b037d6a1935786ab0ab9ad188178b71b4e4004464  src/icloudpd/cli.py" | sha256sum -c -
+          echo "6a96b7b4c9f4381236a6d0e5ce997a6cd4284bd26f6ccdf07f6c8214e6d0cae0  src/icloudpd/config.py" | sha256sum -c -
+          echo "7b052e3bbdafb982e601fe210b48f3d9ddddc216bf39e4a4fbbef02350f19ab6  src/icloudpd/guided_setup.py" | sha256sum -c -
+          echo "79a597990aa62435b782635c2fd268041533d6781108a149b63a38473414f91a  src/icloudpd/remember.py" | sha256sum -c -
+          echo "fada7a3ceeda86322e92e092567909910a04b665fde86aad3f1f3aa4198f8b96  src/pyicloud_ipd/base.py" | sha256sum -c -
+          echo "e0fcc7a5e1dfdcad0e6ead6106177e19ce2e55085c9be10ffca9a979383a3c51  src/pyicloud_ipd/services/photos.py" | sha256sum -c -
+          echo "58ebd11b2b00bce1e51dbf2e3b66ca0a706ed3dafe1d8f26ac9d95f7de0e793d  src/starters/icloudpd.py" | sha256sum -c -
+
+      - name: Bake version info
+        run: |
+          cd build
+          python - "$ICLOUDPD_VERSION" "$ICLOUDPD_COMMIT_SHA" "$ICLOUDPD_COMMIT_TS" <<'PY'
+          import pathlib
+          import sys
+
+          version, sha, ts = sys.argv[1], sys.argv[2], sys.argv[3]
+          path = pathlib.Path("src/foundation/__init__.py")
+          text = path.read_text()
+          text = text.replace('version="0.0.1"', f'version="{version}"')
+          text = text.replace('commit_sha="abcdefgh"', f'commit_sha="{sha}"')
+          text = text.replace("commit_timestamp=1234567890", f"commit_timestamp={ts}")
+          path.write_text(text)
+          print(text[text.index("version_info = VersionInfo") :][:200])
+          PY
+
+      - name: Sanity-check the customizations landed
+        run: |
+          cd build
+          test -f src/icloudpd/guided_setup.py
+          test -f src/icloudpd/remember.py
+          grep -n 'default="original"' src/icloudpd/cli.py
+          grep -n 'no-pause' src/icloudpd/cli.py
+          grep -n 'ignore-indexing-state' src/icloudpd/cli.py
+          grep -n 'ICLOUDPD_INDEXING_TIMEOUT' src/pyicloud_ipd/services/photos.py
+          grep -n 'sys.exit(cli())' src/starters/icloudpd.py
+          grep -n 'version="1.32.3"' src/foundation/__init__.py
+
+      - name: Install dependencies
+        run: |
+          cd build
+          python -m pip install --disable-pip-version-check --upgrade "pip>=25.1"
+          python -m pip install --disable-pip-version-check -r requirements-pip.txt
+          python -m pip install --disable-pip-version-check -e . --group dev
+          pyinstaller --version
+
+      - name: Build the single-file executable
+        run: |
+          cd build
+          bash scripts/build_bin1 icloudpd
+          ls -la dist
+
+      - name: Collect the artifact
+        env:
+          ASSET: icloudpd-linux-x86_64
+        run: |
+          cd build
+          uname -m
+          file dist/icloudpd
+          # a Linux build is only as portable as the glibc it was linked against
+          ldd --version | head -1
+          mkdir -p out
+          cp dist/icloudpd "out/$ASSET"
+          chmod +x "out/$ASSET"
+          cd out
+          sha256sum "$ASSET" > "$ASSET.sha256"
+          cat "$ASSET.sha256"
+          ls -la
+
+      - name: Upload as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: icloudpd-linux-x86_64
+          if-no-files-found: error
+          path: build/out/*
+
+      - name: Attach to a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gh cannot infer the repository here: build/ is a throwaway git repo
+          # created only so that `git apply` has somewhere to run, and it has no
+          # remote (that surfaces as "no git remotes found").
+          GH_REPO: ${{ github.repository }}
+          ASSET: icloudpd-linux-x86_64
+        run: |
+          cd build/out
+          TAG="linux-${ASSET}-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" \
+            --title "${ASSET} - build ${GITHUB_RUN_NUMBER}" \
+            --notes "Automated Linux x86_64 build (glibc 2.35, ubuntu-22.04). Upstream ${UPSTREAM_REPO} at ${UPSTREAM_SHA}. Customizations: guided setup, remembered Apple ID and directory, live photo filename policy default = original, no keyring in the guided password prompt, press-any-key exit prompt only when attached to a terminal, polling wait for unfinished iCloud photo indexing (ICLOUDPD_INDEXING_TIMEOUT), opt-in --ignore-indexing-state, and the real exit code on failure." \
+            "$ASSET" "$ASSET.sha256"
