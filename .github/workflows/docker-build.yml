@@ -78,9 +78,18 @@ jobs:
             type=raw,value=latest
             type=raw,value=${{ env.ICLOUDPD_VERSION }}
             type=raw,value=${{ env.ICLOUDPD_VERSION }}-b${{ github.run_number }}
-          # Without this the action fills these in from the repository, and the
-          # image ends up described as "iCloudpd-Mac-Win" with an empty license.
+          # Without these the action fills them in from the repository, and the
+          # image goes out titled "iCloudpd-Mac-Win" with an empty license --
+          # which is what `docker inspect` and `buildx imagetools inspect` show.
+          # labels land in the image config, annotations on the manifest; both
+          # default to the repository, so both have to be overridden.
           labels: |
+            org.opencontainers.image.title=icloudpd
+            org.opencontainers.image.description=iCloud Photos Downloader with a guided setup, a polling wait for unfinished iCloud indexing and opt-in --ignore-indexing-state
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.version=${{ env.ICLOUDPD_VERSION }}
+          annotations: |
             org.opencontainers.image.title=icloudpd
             org.opencontainers.image.description=iCloud Photos Downloader with a guided setup, a polling wait for unfinished iCloud indexing and opt-in --ignore-indexing-state
             org.opencontainers.image.licenses=MIT
