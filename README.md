@@ -16,7 +16,7 @@ workflow 会按 pin 的 commit 拉上游 tarball，把差异打进去，再用 P
 | `custom/build_mac_bin.sh` | macOS 打包脚本 |
 | `scripts/upstream_sync.py` | 上游发新版时的 rebase 工具 |
 | `.github/workflows/build-win-exe.yml` | Windows x64 单文件 exe |
-| `.github/workflows/build-linux-bin.yml` | Linux x86_64 单文件可执行程序（ubuntu-22.04 / glibc 2.35） |
+| `.github/workflows/build-linux-bin.yml` | Linux x86_64 + arm64 单文件可执行程序（ubuntu-22.04 / -arm，glibc 2.35） |
 | `.github/workflows/build-mac-bin.yml` | macOS arm64 + x86_64 单文件可执行程序 |
 | `.github/workflows/upstream-sync.yml` | 每周检查上游是否有新版 |
 

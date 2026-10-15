@@ -1,4 +1,4 @@
-# Builds a single-file Linux x86_64 executable for the customized icloudpd.
+# Builds single-file Linux executables for the customized icloudpd.
 #
 # Same design as build-win-exe.yml: this repository does NOT carry the upstream
 # source. It only carries the files that differ from upstream (see custom/). The
@@ -6,12 +6,16 @@
 # result with PyInstaller.
 #
 # PyInstaller cannot cross-compile, and a Linux binary is tied to the glibc of
-# the machine that built it. ubuntu-22.04 is pinned rather than ubuntu-latest
-# for exactly that reason: it carries glibc 2.35, so the result still runs on
-# Debian 12 / Ubuntu 22.04 and newer. Building on a newer runner would silently
-# produce a binary that refuses to start on anything older.
+# the machine that built it. ubuntu-22.04 / ubuntu-22.04-arm are pinned rather
+# than ubuntu-latest for exactly that reason: they both carry glibc 2.35, so the
+# result still runs on Debian 12 / Ubuntu 22.04 and newer. Building on a newer
+# runner would silently produce a binary that refuses to start on anything older.
+#
+# The two architectures are a matrix, not two workflows: the build steps are
+# identical and only the runner label and the asset name differ, so keeping one
+# copy means a pin bump cannot update one architecture and forget the other.
 
-name: Build Linux binary (x86_64)
+name: Build Linux binaries
 
 on:
   workflow_dispatch:
@@ -34,8 +38,20 @@ env:
   ICLOUDPD_COMMIT_TS: "1780177342"
 
 jobs:
-  build-linux-x86_64:
-    runs-on: ubuntu-22.04
+  build-linux:
+    strategy:
+      # one architecture failing must not cancel the other
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            uname: x86_64
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            uname: aarch64
+
+    runs-on: ${{ matrix.runner }}
 
     defaults:
       run:
@@ -126,10 +142,15 @@ jobs:
 
       - name: Collect the artifact
         env:
-          ASSET: icloudpd-linux-x86_64
+          ASSET: icloudpd-linux-${{ matrix.arch }}
+          EXPECT_UNAME: ${{ matrix.uname }}
         run: |
           cd build
-          uname -m
+          # the runner label can be wrong; the binary is what matters. Assert the
+          # machine really is the architecture we are about to name the file after.
+          UNAME="$(uname -m)"
+          echo "uname -m = $UNAME, expected $EXPECT_UNAME"
+          test "$UNAME" = "$EXPECT_UNAME"
           file dist/icloudpd
           # a Linux build is only as portable as the glibc it was linked against
           ldd --version | head -1
@@ -144,7 +165,7 @@ jobs:
       - name: Upload as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: icloudpd-linux-x86_64
+          name: icloudpd-linux-${{ matrix.arch }}
           if-no-files-found: error
           path: build/out/*
 
@@ -155,11 +176,12 @@ jobs:
           # created only so that `git apply` has somewhere to run, and it has no
           # remote (that surfaces as "no git remotes found").
           GH_REPO: ${{ github.repository }}
-          ASSET: icloudpd-linux-x86_64
+          ASSET: icloudpd-linux-${{ matrix.arch }}
+          ARCH: ${{ matrix.arch }}
         run: |
           cd build/out
           TAG="linux-${ASSET}-${GITHUB_RUN_NUMBER}"
           gh release create "$TAG" \
             --title "${ASSET} - build ${GITHUB_RUN_NUMBER}" \
-            --notes "Automated Linux x86_64 build (glibc 2.35, ubuntu-22.04). Upstream ${UPSTREAM_REPO} at ${UPSTREAM_SHA}. Customizations: guided setup, remembered Apple ID and directory, live photo filename policy default = original, no keyring in the guided password prompt, press-any-key exit prompt only when attached to a terminal, polling wait for unfinished iCloud photo indexing (ICLOUDPD_INDEXING_TIMEOUT), opt-in --ignore-indexing-state, and the real exit code on failure." \
+            --notes "Automated Linux ${ARCH} build (glibc 2.35, ubuntu-22.04). Upstream ${UPSTREAM_REPO} at ${UPSTREAM_SHA}. Customizations: guided setup, remembered Apple ID and directory, live photo filename policy default = original, no keyring in the guided password prompt, press-any-key exit prompt only when attached to a terminal, polling wait for unfinished iCloud photo indexing (ICLOUDPD_INDEXING_TIMEOUT), opt-in --ignore-indexing-state, and the real exit code on failure." \
             "$ASSET" "$ASSET.sha256"
