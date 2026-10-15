@@ -78,6 +78,14 @@ jobs:
             type=raw,value=latest
             type=raw,value=${{ env.ICLOUDPD_VERSION }}
             type=raw,value=${{ env.ICLOUDPD_VERSION }}-b${{ github.run_number }}
+          # Without this the action fills these in from the repository, and the
+          # image ends up described as "iCloudpd-Mac-Win" with an empty license.
+          labels: |
+            org.opencontainers.image.title=icloudpd
+            org.opencontainers.image.description=iCloud Photos Downloader with a guided setup, a polling wait for unfinished iCloud indexing and opt-in --ignore-indexing-state
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.version=${{ env.ICLOUDPD_VERSION }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -98,18 +106,21 @@ jobs:
           cache-to: type=gha,mode=max
 
       # A green build only proves the patch applied. This proves the image that
-      # was pushed actually exposes the customizations.
+      # was pushed actually exposes the customizations -- on both architectures,
+      # because QEMU makes "it built" and "it runs" two different questions.
       - name: Smoke-test the pushed image
         env:
           IMAGE: ${{ steps.image.outputs.repo }}:${{ env.ICLOUDPD_VERSION }}-b${{ github.run_number }}
         run: |
           set -eu
           echo "checking $IMAGE"
-          docker run --rm --platform linux/amd64 "$IMAGE" --help > help.txt
-          grep -q -- '--ignore-indexing-state' help.txt
-          grep -q -- '--no-pause' help.txt
-          grep -q -- '--no-remember' help.txt
-          echo "  help text carries the customizations"
-          docker run --rm --platform linux/amd64 "$IMAGE" --version
-          docker run --rm --platform linux/amd64 "$IMAGE" icloud --help > icloud-help.txt
-          head -3 icloud-help.txt
+          for platform in linux/amd64 linux/arm64; do
+            echo "--- $platform ---"
+            docker run --rm --platform "$platform" "$IMAGE" --help > help.txt
+            grep -q -- '--ignore-indexing-state' help.txt
+            grep -q -- '--no-pause' help.txt
+            grep -q -- '--no-remember' help.txt
+            echo "  help text carries the customizations"
+            docker run --rm --platform "$platform" "$IMAGE" --version
+            docker run --rm --platform "$platform" "$IMAGE" icloud --help | head -1
+          done
