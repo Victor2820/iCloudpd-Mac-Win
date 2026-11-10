@@ -1,0 +1,94 @@
+# Builds the iCloudx launcher for Windows - the small UI shell that drives
+# the user-supplied iCloudx-Win.exe. It ships WITHOUT the icloudpd backend:
+# the launcher looks for iCloudx-Win.exe beside itself at runtime, so the
+# backend can be swapped for a newer release without rebuilding the shell.
+#
+# Unlike build-win-exe.yml this needs no upstream source or patches - it
+# packages custom/icloudx/icloudx_launcher.py as a windowed one-file exe.
+
+name: Build iCloudx Launcher (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "custom/icloudx/icloudx_launcher.py"
+      - ".github/workflows/build-win-launcher.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build-win-launcher:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Sanity-check the launcher source
+        run: |
+          python -m py_compile custom/icloudx/icloudx_launcher.py
+          grep -n "live-photo-mov-filename-policy" custom/icloudx/icloudx_launcher.py
+          grep -n "iCloudx-Win.exe" custom/icloudx/icloudx_launcher.py
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade "pip>=25.1"
+          python -m pip install --disable-pip-version-check pyinstaller
+          pyinstaller --version
+
+      - name: Build the windowed one-file executable
+        run: |
+          python -m PyInstaller --noconfirm \
+            --workpath build/icloudx-work --distpath build/icloudx-dist \
+            --windowed --onefile --name "iCloudx-Launcher-Win" \
+            custom/icloudx/icloudx_launcher.py
+          ls -la build/icloudx-dist
+
+      - name: Collect the artifact
+        run: |
+          mkdir -p out
+          cp build/icloudx-dist/iCloudx-Launcher-Win.exe out/
+          cd out
+          python - <<'PY'
+          import hashlib
+          import pathlib
+
+          path = pathlib.Path("iCloudx-Launcher-Win.exe")
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          pathlib.Path("iCloudx-Launcher-Win.exe.sha256").write_text(
+              f"{digest}  iCloudx-Launcher-Win.exe\n"
+          )
+          print("sha256:", digest)
+          print("bytes :", path.stat().st_size)
+          PY
+          ls -la
+
+      - name: Upload as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: icloudx-launcher-win
+          if-no-files-found: error
+          path: out/*
+
+      - name: Attach to a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd out
+          TAG="icloudx-launcher-win-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" \
+            --title "iCloudx-Launcher-Win.exe - build ${GITHUB_RUN_NUMBER}" \
+            --notes "iCloudx 图形启动器（Windows x64）。放到 iCloudx-Win.exe 旁边运行即可，不内嵌主程序，主程序可随时替换为新版。" \
+            iCloudx-Launcher-Win.exe iCloudx-Launcher-Win.exe.sha256
