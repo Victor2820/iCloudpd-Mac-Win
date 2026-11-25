@@ -1,0 +1,98 @@
+# Builds the current iCloudx Material UI as a windowed one-file Windows exe.
+# The icloudpd backend stays external (iCloudpd-Win.exe beside the exe).
+
+name: Build iCloudx UI (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - "custom/icloudx/iCloudx.py"
+      - ".github/workflows/build-icloudx-ui-win.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build-icloudx-ui:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Sanity-check the source
+        run: |
+          python -m py_compile custom/icloudx/iCloudx.py
+          grep -n "iCloudpd-Win.exe" custom/icloudx/iCloudx.py
+          grep -n "live-photo-mov-filename-policy" custom/icloudx/iCloudx.py
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade "pip>=25.1"
+          python -m pip install --disable-pip-version-check pyinstaller
+          pyinstaller --version
+
+      - name: Build windowed one-file exe
+        run: |
+          python -m PyInstaller --noconfirm \
+            --workpath build/icloudx-ui-work --distpath build/icloudx-ui-dist \
+            --windowed --onefile --name "iCloudx" \
+            custom/icloudx/iCloudx.py
+          ls -la build/icloudx-ui-dist
+
+      - name: Collect artifact
+        run: |
+          mkdir -p out
+          cp build/icloudx-ui-dist/iCloudx.exe out/
+          cd out
+          python - <<'PY'
+          import hashlib
+          import pathlib
+
+          path = pathlib.Path("iCloudx.exe")
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+          pathlib.Path("iCloudx.exe.sha256").write_text(
+              f"{digest}  iCloudx.exe\n"
+          )
+          pathlib.Path("README.txt").write_text(
+              "iCloudx 下载工具 (Windows x64)\n"
+              "================================\n\n"
+              "1. 把 iCloudx.exe 和 iCloudpd-Win.exe 放在同一个文件夹。\n"
+              "2. 双击 iCloudx.exe，填写账号、密码、选区、保存目录。\n"
+              "3. 主程序默认读取同目录的 iCloudpd-Win.exe，可在界面里手动改。\n"
+              "4. 配置文件与日志会写在 exe 所在目录，不写入系统目录。\n",
+              encoding="utf-8",
+          )
+          print("sha256:", digest)
+          print("bytes :", path.stat().st_size)
+          PY
+          ls -la
+
+      - name: Upload as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: icloudx-ui-win
+          if-no-files-found: error
+          path: out/*
+
+      - name: Attach to a release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd out
+          TAG="icloudx-ui-win-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" \
+            --title "iCloudx UI Windows - build ${GITHUB_RUN_NUMBER}" \
+            --notes "iCloudx Material UI 启动器（Windows x64，单文件 exe）。主程序 iCloudpd-Win.exe 不内嵌，放到 exe 同级目录即可，可随时替换版本。" \
+            iCloudx.exe iCloudx.exe.sha256 README.txt
